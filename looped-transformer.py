@@ -1,3 +1,5 @@
+#Looped Transformers as Programmable Computers   @https://arxiv.org/pdf/2301.13196.pdf
+
 import torch
 
 class Atte(torch.nn.Module):
@@ -30,59 +32,64 @@ class Atte(torch.nn.Module):
         return o
 
 class Embd(torch.nn.Module):
-    def __init__(self, vocab_size, block_size, n_embd, dropout=0.0, device=None, dtype=None):
+    def __init__(self, vocab_size, block_size, n_embd, dropout=0.0, device=None, dtype=None, simple_encode=False):
         super().__init__()
         self.wte = torch.nn.Embedding(vocab_size, n_embd).to(device)
-        self.wpe = torch.nn.Embedding(block_size, n_embd).to(device)
-        self.drop = torch.nn.Dropout(dropout)
+        self.simple_encode = simple_encode
+        if self.simple_encode:
+            self.wpe = torch.nn.Embedding(block_size, n_embd).to(device)
+            self.drop = torch.nn.Dropout(dropout)
 
-    def forward(self, idx, simple_encode=1):
-        if simple_encode:
+    def forward(self, idx):
+        if self.simple_encode:
             pos = torch.arange(0, idx.size()[1], dtype=torch.long, device=idx.device).unsqueeze(0)  #[0,1,2,3,4,5,]
-        else:
+            tok_emb = self.wte(idx) 
+            pos_emb = self.wpe(pos)
+            emb = tok_emb + pos_emb   #add, not cat
+            o = self.drop(emb)
+        else:  #for location-sensitive @looped-transformer
             def dec2bin(d, n):  #n=8: math.log(8)=2.0794415416798357 dimension
                 bin_msk = 2 ** torch.arange(n - 1, -1, -1).to(d.device, d.dtype)  #torch.arange(0, n, 1).unsqueeze(0)
-                bin_seq = d.unsqueeze(-1).bitwise_and(bin_msk).ne(0).type(torch.float)  #unsqueeze(1 or -1)  type(int16) .int() .float() 
+                bin_seq = d.unsqueeze(-1).bitwise_and(bin_msk).ne(0).type(torch.int16)  #unsqueeze(1 or -1)  
                 return bin_seq
             def bin2dec(b, n):
                 bin_msk = 2 ** torch.arange(n - 1, -1, -1).to(b.device, b.dtype)
                 dec_num = torch.sum(bin_msk * b, -1)
                 return dec_num
 
-            print('idx', idx.shape)
-            s,n = idx.size()[0], idx.size()[1]  #batch,length  #John: too-long-length-issue?
+            batch_size, sequence_length = idx.size()[0], idx.size()[1]  #too-long-length-issue?
 
-            pos_idx = torch.linspace(0, n, steps=n, device=idx.device, dtype=idx.dtype, requires_grad=False).repeat(s,1)
-            print('pos_idx', pos_idx.shape, pos_idx)
+            #forward, +-1 binarization
+            pos_idx = torch.linspace(0, sequence_length, steps=sequence_length, device=idx.device, dtype=idx.dtype, requires_grad=False).repeat(batch_size,1)
+            #print('pos_idx', pos_idx.shape, pos_idx)  #(batch_size, sequence_length)
 
-            bin_seq = dec2bin(pos_idx, n)
-            print('bin_seq', bin_seq.shape, bin_seq)
-            pos_enc = torch.where(bin_seq== 0, -torch.ones_like(bin_seq), +torch.ones_like(bin_seq))
-            print('pos_enc', pos_enc.shape, pos_enc)  #cat this after token-embeded?
+            bin_seq = dec2bin(pos_idx, sequence_length)
+            #print('bin_seq', bin_seq.shape, bin_seq)  #(batch_size, sequence_length,sequence_length)
+            pos_enc = torch.where(bin_seq== 0, -torch.ones_like(bin_seq), +torch.ones_like(bin_seq))  #need-not: .repeat(tok_emb.shape[0], 1, 1), because has been pos_idx in pos_idx=torch.linspace().repeat(batch_size,1)
+            #print('pos_enc', pos_enc.shape, pos_enc)  #(batch_size, sequence_length,sequence_length)  #cat this after token-embeded? or convert to shorter float?
+            
+            if 1:  #backward, reverse; for-later-computing 
+                bin_seq = torch.where(pos_enc==-1, torch.zeros_like(pos_enc), +torch.ones_like(pos_enc))
+                #print('bin_seq', bin_seq.shape, bin_seq)  #(batch_size, sequence_length,sequence_length)
 
-            #bin_seq = torch.where(pos_enc==-1, torch.zeros_like(pos_enc), +torch.ones_like(pos_enc))
-            #print('bin_seq', bin_seq.shape, bin_seq)
+                pos_idx = bin2dec(bin_seq, sequence_length)
+                #print('pos_idx', pos_idx.shape, pos_idx)  #(batch_size, sequence_length)
 
-            pos_num = bin2dec(pos_enc, n)
-            print('pos_num', pos_num.shape, pos_num)
+            if 0:  #principle understand; Cauchy-Schwarz-inequality
+                pos_enc_dot = torch.bmm(pos_enc, pos_enc.permute(0, -2,-1))  #transpose/permute;  matmul->batach-matmul/bmm
+                print('pos_enc_dot', pos_enc_dot.shape, pos_enc_dot)  #(batch_size, sequence_length, sequence_length)
 
-            ##pos_enc_dot = torch.matmul(pos_enc, pos_enc.t())
-            ##print('pos_enc_dot', pos_enc_dot.shape, pos_enc_dot)
+            tok_emb = self.wte(idx) 
+            #print('tok_emb', tok_emb.shape)  #(batch_size, sequence_length, embed_dimension)
+            #print('pos_enc', pos_enc.shape)  #(batch_size, sequence_length, sequence_length)
+            o = torch.cat((tok_emb, pos_enc), dim=-1)
+            #print('o', o.shape)    #(batch_size, sequence_length, embed_dimension+sequence_length)
 
-            raise
-        pos_emb = self.wpe(pos)
-        tok_emb = self.wte(idx) 
-        print('pos_emb', pos_emb.shape)
-        print('tok_emb', tok_emb.shape)
-        if simple_encode:
-            emb = tok_emb + pos_emb
-        else:
-            pos_emb = pos_emb.repeat(tok_emb.shape[0], 1, 1)
-            emb = torch.cat((tok_emb, pos_emb), dim=-1)
-        o = self.drop(emb)
+            import time; time.sleep(333)   #just-for-debug
+
         return o
 
-class Task(torch.nn.Module):
+class Task(torch.nn.Module):  #TODO some simple task to show looped-transformer
     def __init__(self, n_embd, vocab_size, device=None, dtype=None):
         super().__init__()
         self.norm = torch.nn.LayerNorm(n_embd)
