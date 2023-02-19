@@ -2,33 +2,67 @@
 
 import torch
 
-class Atte(torch.nn.Module):
-    def __init__(self, d_model, nhead, d_feedforward, batch_first, dropout=0.1, norm_first=True, layer_norm_eps=1e-5, device=None, dtype=None):
+class Core(torch.nn.Module):
+    class Attention(torch.nn.Module):  #expanded-implemented-by-myself attention for looped-transformer
+        def __init__(self, dim_in, dim_q, dim_k):
+            super().__init__()
+            self.q = torch.nn.Linear(dim_in, dim_q)  #TODO: qkv=nn.Linear(dim_in*3, dim_q) @PyTorch
+            self.k = torch.nn.Linear(dim_in, dim_k)
+            self.v = torch.nn.Linear(dim_in, dim_k)
+
+        def forward(self, query, key, value, attn_mask, key_padding_mask, need_weights):  #not-use-so-far: attn_mask, key_padding_mask, need_weights
+            def scaled_dot_product_attention(query, key, value):
+                temp = query.bmm(key.transpose(1, 2))
+                scale = query.size(-1) ** 0.5  #scale-or-not @loop_transformer?
+                weights = torch.nn.functional.softmax(temp / scale, dim=-1)  #hardmax@loop_transformer?
+                return weights.bmm(value), weights if need_weights else None
+            return scaled_dot_product_attention(self.q(query), self.k(key), self.v(value))
+
+    class MultiHeadAttention(torch.nn.Module):  #No Mask for Causal
+        def __init__(self, dim_in, dim_q, dim_k, num_heads):
+            super().__init__()
+            self.heads = torch.nn.ModuleList([Attention(dim_in, dim_q, dim_k) for _ in range(num_heads)])
+            self.linear = torch.nn.Linear(num_heads * dim_k, dim_in)
+
+        def forward(self, query, key, value, attn_mask, key_padding_mask, need_weights):
+            attent_outputs = []
+            attent_weights = []
+            for head in self.heads:
+                attent_output_weight = head(query, key, value, attn_mask, key_padding_mask, need_weights)
+                attent_outputs.append(attent_output_weight[0])
+                if need_weights:  #TODO refer to multi_head_attention_forward in functional.py @pytorch;   only-used-singlehead-attention in looped-transformer?
+                    attent_weights.append(attent_output_weight[1])
+            return self.linear(torch.cat(attent_outputs, dim=-1)), torch.mean(attn_output_weights, dim=1) if need_weights else None
+
+    def __init__(self, d_model, nhead=None, d_feedforward=None, batch_first=None, dropout=None, norm_first=None, layer_norm_eps=0.00001, device=None, dtype=None):
         super().__init__()
         self.norm_first = norm_first
         factory_kwargs = {'device': device, 'dtype': dtype}
-        self.norm1 = torch.nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
-        self.mha = torch.nn.modules.activation.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first, **factory_kwargs)
-        self.dropout1 = torch.nn.Dropout(dropout)
+        self.norm1 = torch.nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs) if norm_first is not None else None
+        self.attent = self.__class__.Attention(d_model, d_model, d_model)  #self.__class__.MultiHeadAttention(d_model, d_model, d_model, nhead)  #torch.nn.modules.activation.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first, **factory_kwargs)
+        self.dropout1 = torch.nn.Dropout(dropout) if dropout is not None else None
         #
         self.ffw = torch.nn.Sequential(torch.nn.Linear(d_model, d_feedforward), torch.nn.ReLU(), torch.nn.Linear(d_feedforward, d_model))
-        self.dropout2 = torch.nn.Dropout(dropout)
-        self.norm2 = torch.nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+        self.dropout2 = torch.nn.Dropout(dropout) if dropout is not None else None
+        self.norm2 = torch.nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs) if norm_first is not None else None
 
     def forward(self, x, attn_mask=None, key_padding_mask=None):
         a = x
-        if self.norm_first:
-           a = self.norm1(a)
-        a = self.mha(a, a, a, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=False)[0]
-        a = self.dropout1(a)
+        if self.norm1 is not None and self.norm_first:
+            a = self.norm1(a)
+        a = self.attent(a, a, a, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=False)[0]
+        if self.dropout1 is not None:
+            a = self.dropout1(a)
         o = x + a
-        if not self.norm_first:
+        if self.norm1 is not None and not self.norm_first:
             o = self.norm1(o)
         #
         f = self.ffw(o)
-        f = self.dropout2(f)
+        if self.dropout2 is not None:
+            f = self.dropout2(f)
         o = o + f
-        o = self.norm2(o)
+        if self.norm2 is not None:
+            o = self.norm2(o)
         return o
 
 class Embd(torch.nn.Module):
@@ -66,7 +100,7 @@ class Embd(torch.nn.Module):
             bin_seq = dec2bin(pos_idx, sequence_length)
             #print('bin_seq', bin_seq.shape, bin_seq)  #(batch_size, sequence_length,sequence_length)
             pos_enc = torch.where(bin_seq== 0, -torch.ones_like(bin_seq), +torch.ones_like(bin_seq))  #need-not: .repeat(tok_emb.shape[0], 1, 1), because has been pos_idx in pos_idx=torch.linspace().repeat(batch_size,1)
-            #print('pos_enc', pos_enc.shape, pos_enc)  #(batch_size, sequence_length,sequence_length)  #cat this after token-embeded? or convert to shorter float?
+            #print('pos_enc', pos_enc.shape, pos_enc)  #(batch_size, sequence_length,sequence_length)  #+-1  #cat this after token-embeded? or convert to shorter float?
             
             if 1:  #backward, reverse; for-later-computing 
                 bin_seq = torch.where(pos_enc==-1, torch.zeros_like(pos_enc), +torch.ones_like(pos_enc))
@@ -75,7 +109,7 @@ class Embd(torch.nn.Module):
                 pos_idx = bin2dec(bin_seq, sequence_length)
                 #print('pos_idx', pos_idx.shape, pos_idx)  #(batch_size, sequence_length)
 
-            if 0:  #principle understand; Cauchy-Schwarz-inequality
+            if 0:  #principle understand; Cauchy-Schwarz-inequality  #TODO pick one column to valid: p_i_up_t * p_i = log(n)
                 pos_enc_dot = torch.bmm(pos_enc, pos_enc.permute(0, -2,-1))  #transpose/permute;  matmul->batach-matmul/bmm
                 print('pos_enc_dot', pos_enc_dot.shape, pos_enc_dot)  #(batch_size, sequence_length, sequence_length)
 
@@ -85,9 +119,20 @@ class Embd(torch.nn.Module):
             o = torch.cat((tok_emb, pos_enc), dim=-1)
             #print('o', o.shape)    #(batch_size, sequence_length, embed_dimension+sequence_length)
 
-            import time; time.sleep(333)   #just-for-debug
-
         return o
+
+#Scratchpad
+#Memory
+#Commands
+
+#data-read
+#data-write  copy/move
+#program-counter
+#positional-encoding
+#temporary-storage
+#scratchpad-indicate
+
+#hardmax  #not-softmax
 
 class Task(torch.nn.Module):  #TODO some simple task to show looped-transformer
     def __init__(self, n_embd, vocab_size, device=None, dtype=None):
@@ -110,13 +155,13 @@ class Mind(torch.nn.Module):
     def __init__(self, n_layer, vocab_size, block_size, d_model, nhead, d_feedforward, batch_first=True, device=None):
         super().__init__()
         self.embd = Embd(vocab_size=vocab_size, block_size=block_size, n_embd=d_model).to(device)
-        self.deep = torch.nn.ModuleList([Atte(d_model=d_model, nhead=nhead, d_feedforward=d_feedforward, batch_first=batch_first).to(device) for _ in range(n_layer)])
-        self.task = Task(n_embd=d_model, vocab_size=vocab_size).to(device)
+        self.loop = torch.nn.ModuleList([Core(d_model=d_model+block_size, nhead=nhead, d_feedforward=d_feedforward, batch_first=batch_first).to(device) for _ in range(n_layer)])
+        self.task = Task(n_embd=d_model+block_size, vocab_size=vocab_size).to(device)
 
     def forward(self, I, decode):
         H = self.embd(I)
-        for atte in self.deep:
-            H = atte(H)
+        for core in self.loop:
+            H = core(H)
         T = self.task(H, decode=decode)
         return T
 
