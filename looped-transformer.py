@@ -1,5 +1,3 @@
-#Looped Transformers as Programmable Computers   @https://arxiv.org/pdf/2301.13196.pdf
-
 import torch
 
 class Core(torch.nn.Module):
@@ -66,22 +64,46 @@ class Core(torch.nn.Module):
         return o
 
 class Embd(torch.nn.Module):
-    def __init__(self, vocab_size, block_size, n_embd, dropout=0.0, device=None, dtype=None, simple_encode=False):
+    Encode_Type = ['embedding', 'binary_vector','normal_normal','patch_normal']   #binary_vector@looped-transformer  normal_normal@igpt  patch_normal@moco/timm
+    def __init__(self, vocab_size, block_size, n_embd, dropout=0.0, device=None, dtype=None, encode_type=Encode_Type[3]):
         super().__init__()
-        self.wte = torch.nn.Embedding(vocab_size, n_embd).to(device)
-        self.simple_encode = simple_encode
-        if self.simple_encode:
+        self.encode_type = encode_type
+        if self.encode_type==self.__class__.Encode_Type[0]:
+            self.wte = torch.nn.Embedding(vocab_size, n_embd).to(device)
             self.wpe = torch.nn.Embedding(block_size, n_embd).to(device)
-            self.drop = torch.nn.Dropout(dropout)
+            self.drp = torch.nn.Dropout(dropout)
+        elif self.encode_type==self.__class__.Encode_Type[1]:
+            self.wte = torch.nn.Embedding(vocab_size, n_embd).to(device)
+        elif self.encode_type==self.__class__.Encode_Type[2]:
+            self.wte = torch.randn([vocab_size, n_embd], dtype=torch.float, requires_grad=False).to(device) *0.01  #torch.normal(means, std, out=None)
+            self.wpe = torch.randn([block_size, n_embd], dtype=torch.float, requires_grad=False).to(device) *0.02 
+        elif self.encode_type==self.__class__.Encode_Type[3]:
+            class PatchEmbed(torch.nn.Module):  #for-image
+                def __init__(self, img_size, patch_size=16, in_chans=3, embed_dim=768):
+                    super().__init__()
+                    num_patches = (img_size // patch_size) * (img_size // patch_size)
+                    self.img_size = img_size
+                    self.patch_size = patch_size
+                    self.num_patches = num_patches
+                    self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+                def forward(self, x):
+                    B, C, H, W = x.shape
+                    x = self.proj(x).flatten(2).transpose(1, 2)
+                    return x
+            #self.wte = PatchEmbed(img_size=224, in_chans=3, embed_dim=n_embd, patch_size=16)   #img
+            self.wte = torch.nn.Embedding(vocab_size, n_embd).to(device)   #txt
+            self.wpe = torch.nn.Parameter(torch.randn(1, block_size, n_embd) *0.02)
+        else:
+            raise
 
     def forward(self, idx):
-        if self.simple_encode:
+        if self.encode_type==self.__class__.Encode_Type[0]:
             pos = torch.arange(0, idx.size()[1], dtype=torch.long, device=idx.device).unsqueeze(0)  #[0,1,2,3,4,5,]
             tok_emb = self.wte(idx) 
             pos_emb = self.wpe(pos)
             emb = tok_emb + pos_emb   #add, not cat
-            o = self.drop(emb)
-        else:  #for location-sensitive @looped-transformer
+            o = self.drp(emb)
+        elif self.encode_type==self.__class__.Encode_Type[1]:  #for location-sensitive @looped-transformer
             def dec2bin(d, n):  #n=8: math.log(8)=2.0794415416798357 dimension
                 bin_msk = 2 ** torch.arange(n - 1, -1, -1).to(d.device, d.dtype)  #torch.arange(0, n, 1).unsqueeze(0)
                 bin_seq = d.unsqueeze(-1).bitwise_and(bin_msk).ne(0).type(torch.int16)  #unsqueeze(1 or -1)  
@@ -118,21 +140,33 @@ class Embd(torch.nn.Module):
             #print('pos_enc', pos_enc.shape)  #(batch_size, sequence_length, sequence_length)
             o = torch.cat((tok_emb, pos_enc), dim=-1)
             #print('o', o.shape)    #(batch_size, sequence_length, embed_dimension+sequence_length)
-
+        elif self.encode_type==self.__class__.Encode_Type[2]:
+            batch_size, sequence_length = idx.size()[0], idx.size()[1]
+            pos_idx = torch.linspace(0, sequence_length, steps=sequence_length, device=idx.device, dtype=idx.dtype, requires_grad=False).repeat(batch_size,1)
+            #print('idx', idx.shape)  #[3, 16]
+            #print('pos_idx', pos_idx.shape)  #[3, 16]
+            #print('self.wte', self.wte.shape)  #[333, 128]
+            #print('self.wpe', self.wpe.shape)  #[16, 128]
+            tok_emb = torch.gather(self.wte, 0, idx)  #TODO  gather-nd  https://discuss.pytorch.org/t/how-to-do-the-tf-gather-nd-in-pytorch/6445
+            pos_emb = torch.gather(self.wpe, 0, pos_idx) 
+            print('tok_emb', tok_emb.shape)  #pos_emb
+            print('pos_emb', pos_emb.shape)  #pos_emb
+            o = tok_emb + pos_emb   #add, not cat
+        elif self.encode_type==self.__class__.Encode_Type[3]:
+            batch_size, sequence_length = idx.size()[0], idx.size()[1]
+            pos_idx = torch.linspace(0, sequence_length, steps=sequence_length, device=idx.device, dtype=idx.dtype, requires_grad=False).repeat(batch_size,1)
+            #print('idx', idx.shape)  #[3, 16]
+            #print('pos_idx', pos_idx.shape)  #[3, 16]
+            print('self.wpe', self.wpe.shape)  #[16, 128]
+            tok_emb = self.wte(idx)  #TODO  gather-nd  https://discuss.pytorch.org/t/how-to-do-the-tf-gather-nd-in-pytorch/6445
+            pos_emb = self.wpe  #torch.gather(self.wpe, 0, pos_idx) 
+            print('tok_emb', tok_emb.shape)  #pos_emb
+            print('pos_emb', pos_emb.shape)  #pos_emb
+            o = tok_emb + pos_emb   #add, not cat
+            print('o', o.shape)  #[3, 16, 128]
+        else:
+            raise
         return o
-
-#Scratchpad
-#Memory
-#Commands
-
-#data-read
-#data-write  copy/move
-#program-counter
-#positional-encoding
-#temporary-storage
-#scratchpad-indicate
-
-#hardmax  #not-softmax
 
 class Task(torch.nn.Module):  #TODO some simple task to show looped-transformer
     def __init__(self, n_embd, vocab_size, device=None, dtype=None):
@@ -184,3 +218,33 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+#Scratchpad
+#Memory
+#Commands
+#hardmax  #not-softmax
+class Loop:  #@Looped-Transformer
+    def test():
+        X = torch.tensor([
+            [0,0,0,1],  #data-read
+            [0,0,0,0],  #data-write
+            [0,0,0,0],  #program-counter
+            [1,1,1,1],  #positional-encoding
+            [0,0,0,0],  #temporary-storage
+            [0,0,0,0],  #scratchpad-indicate
+            ])
+        Q = K = torch.tensor([0, 0, 1, 1, 0, 0])
+        KX = torch.matmul(K,X)
+        print('KX', KX.shape)
+        KXu = KX.unsqueeze(0)
+        print('KXu', KXu.shape)
+        KXut = KXu.transpose(0,1)
+        print('KXut', KXut.shape)
+        QX = torch.matmul(Q,X)
+        print('QX', QX.shape)
+        QXu = QX.unsqueeze(0)
+        print('QXu', QXu.shape)
+        Y = torch.matmul(KXut, QXu)
+        print('Y', Y.shape, Y)  #all-by-matrxi-multiply, not vector-multiply
+  
