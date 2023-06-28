@@ -1,4 +1,4 @@
-import torch
+import torch  #completed transformer,  looped-transformer in-development but binary_vector completed, 
 
 class Core(torch.nn.Module):
     class Attention(torch.nn.Module):  #expanded-implemented-by-myself attention for looped-transformer
